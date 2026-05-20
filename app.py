@@ -1,13 +1,13 @@
 """Intraday Stock Prediction Dashboard
 
-Run:
+Run locally:
     pip install streamlit yfinance pandas numpy scikit-learn plotly
-    streamlit run intraday_stock_dashboard.py
+    streamlit run app.py
 
 Notes:
 - Educational use only. Not financial advice.
-- Yahoo Finance intraday data is limited and can be delayed.
-- The app benchmarks a few lightweight models and picks the best one on a time-based validation split.
+- Yahoo Finance intraday data is limited and may be delayed.
+- This app benchmarks lightweight models and picks the best one on a time-based split.
 """
 
 from __future__ import annotations
@@ -42,56 +42,83 @@ st.set_page_config(
 )
 
 st.title("📈 Intraday Stock Prediction Dashboard")
-st.caption(
-    "A Streamlit dashboard for intraday market visualization and next-bar direction prediction."
-)
+st.caption("A Streamlit dashboard for intraday market visualization and next-bar direction prediction.")
 
 
 # -----------------------------
 # Utilities
 # -----------------------------
-
 def normalize_ticker(symbol: str, market: str) -> str:
     symbol = symbol.strip().upper()
+    if not symbol:
+        return "RELIANCE.NS"
     if "." in symbol:
         return symbol
     suffix = ".NS" if market == "NSE" else ".BO"
     return f"{symbol}{suffix}"
 
 
-def standardize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize Yahoo Finance columns to Open/High/Low/Close/Volume."""
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        flat_cols = []
+        for col in out.columns.to_flat_index():
+            parts = [str(part) for part in col if part not in ("", None)]
+            flat_cols.append("_".join(parts) if parts else str(col))
+        out.columns = flat_cols
+    else:
+        out.columns = [str(c) for c in out.columns]
+    return out
+
+
+def standardize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize Yahoo Finance columns to exact Open/High/Low/Close/Volume names."""
+    out = _flatten_columns(df)
+
+    normalized = {str(c).replace(" ", "_").lower(): c for c in out.columns}
 
     def find_col(target: str):
         target_l = target.lower()
-        for col in out.columns:
-            col_s = str(col).replace(" ", "_").lower()
-            if col_s == target_l:
-                return col
-        for col in out.columns:
-            col_s = str(col).replace(" ", "_").lower()
-            if col_s.endswith(f"_{target_l}") or col_s.startswith(f"{target_l}_") or target_l in col_s:
-                return col
+        exact = normalized.get(target_l)
+        if exact is not None:
+            return exact
+        for norm_name, original in normalized.items():
+            if norm_name.endswith(f"_{target_l}") or norm_name.startswith(f"{target_l}_") or target_l in norm_name:
+                return original
         return None
 
     rename_map = {}
     for canonical in ["Open", "High", "Low", "Close", "Volume"]:
         source = find_col(canonical)
-        if source is not None and str(source) != canonical:
+        if source is not None and source != canonical:
             rename_map[source] = canonical
 
-    if rename_map:
-        out = out.rename(columns=rename_map)
+    out = out.rename(columns=rename_map)
+    out.columns = [str(c).replace(" ", "_") for c in out.columns]
 
-    cleaned = []
-    for c in out.columns:
-        if isinstance(c, tuple):
-            parts = [str(p) for p in c if p not in ("", None)]
-            cleaned.append("_".join(parts) if parts else str(c))
-        else:
-            cleaned.append(str(c).replace(" ", "_"))
-    out.columns = cleaned
+    # Fallback: if the columns are still weird, map first five positionally.
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    missing = [c for c in required if c not in out.columns]
+    if missing and len(out.columns) >= 5:
+        pos_map = {}
+        first_five = list(out.columns[:5])
+        for i, canonical in enumerate(required):
+            if canonical not in out.columns and i < len(first_five):
+                pos_map[first_five[i]] = canonical
+        out = out.rename(columns=pos_map)
+
+    return out
+
+
+def get_price_frame(df: pd.DataFrame) -> pd.DataFrame:
+    out = standardize_ohlcv_columns(df)
+    needed = ["Open", "High", "Low", "Close"]
+    if not all(c in out.columns for c in needed):
+        raise ValueError(f"Could not standardize OHLC columns. Found: {list(out.columns)}")
+
+    if "Volume" not in out.columns:
+        out["Volume"] = np.nan
+
     return out
 
 
@@ -124,21 +151,16 @@ def rsi(series: pd.Series, window: int = 14) -> pd.Series:
 
 
 def add_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-    data = df.copy()
-
-    if "Close" not in data.columns:
-        raise ValueError("The downloaded data does not contain a Close column.")
+    data = get_price_frame(df).copy()
 
     close = data["Close"]
-    volume = data["Volume"] if "Volume" in data.columns else pd.Series(index=data.index, dtype=float)
+    volume = data["Volume"]
 
-    # Price/return features
     data["ret_1"] = close.pct_change()
     data["log_ret_1"] = np.log(close / close.shift(1))
     data["ret_3"] = close.pct_change(3)
     data["ret_5"] = close.pct_change(5)
 
-    # Trend features
     for w in (5, 10, 20, 50):
         data[f"sma_{w}"] = close.rolling(w).mean()
         data[f"ema_{w}"] = close.ewm(span=w, adjust=False).mean()
@@ -146,7 +168,6 @@ def add_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
         data[f"mom_{w}"] = close - close.shift(w)
         data[f"pct_from_sma_{w}"] = close / data[f"sma_{w}"] - 1
 
-    # Momentum indicators
     data["rsi_14"] = rsi(close, 14)
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
@@ -154,7 +175,6 @@ def add_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     data["macd_signal"] = data["macd"].ewm(span=9, adjust=False).mean()
     data["macd_hist"] = data["macd"] - data["macd_signal"]
 
-    # Volatility / range
     data["hl_range"] = (data["High"] - data["Low"]) / close
     data["oc_range"] = (data["Open"] - close) / close
     bb_mid = close.rolling(20).mean()
@@ -162,14 +182,11 @@ def add_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     data["bb_width"] = ((bb_mid + 2 * bb_std) - (bb_mid - 2 * bb_std)) / bb_mid
     data["bb_z"] = (close - bb_mid) / bb_std
 
-    # Volume features
-    if "Volume" in data.columns:
-        data["vol_chg"] = volume.pct_change()
-        data["vol_sma_20"] = volume.rolling(20).mean()
-        data["vol_z"] = (volume - data["vol_sma_20"]) / volume.rolling(20).std()
-        data["price_vol"] = data["ret_1"] * data["vol_chg"].fillna(0)
+    data["vol_chg"] = volume.pct_change()
+    data["vol_sma_20"] = volume.rolling(20).mean()
+    data["vol_z"] = (volume - data["vol_sma_20"]) / volume.rolling(20).std()
+    data["price_vol"] = data["ret_1"] * data["vol_chg"].fillna(0)
 
-    # Calendar / session features
     idx = pd.DatetimeIndex(data.index)
     data["dow"] = idx.dayofweek
     data["hour"] = idx.hour
@@ -179,12 +196,9 @@ def add_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     data["sin_minute"] = np.sin(2 * np.pi * data["minute"] / 60)
     data["cos_minute"] = np.cos(2 * np.pi * data["minute"] / 60)
 
-    # Prediction target: whether next close is higher than current close
     data["target"] = (close.shift(-1) > close).astype(int)
 
-    # Drop rows with incomplete features or unknown target
     data = data.replace([np.inf, -np.inf], np.nan).dropna()
-
     y = data.pop("target")
     return data, y
 
@@ -225,48 +239,46 @@ def train_best_model(X: pd.DataFrame, y: pd.Series) -> Tuple[ModelResult, pd.Dat
     for name, model in candidates.items():
         model.fit(X_train, y_train)
         pred = model.predict(X_test)
-        proba = None
         if hasattr(model, "predict_proba"):
             proba = model.predict_proba(X_test)[:, 1]
+        else:
+            proba = np.full(len(X_test), 0.5)
 
         acc = accuracy_score(y_test, pred)
         f1 = f1_score(y_test, pred, zero_division=0)
-        roc = roc_auc_score(y_test, proba) if proba is not None and len(np.unique(y_test)) > 1 else np.nan
+        roc = roc_auc_score(y_test, proba) if len(np.unique(y_test)) > 1 else np.nan
         scored.append(ModelResult(name=name, model=model, accuracy=acc, f1=f1, roc_auc=roc))
 
     scored = sorted(scored, key=lambda r: (r.accuracy, r.f1), reverse=True)
-    best = scored[0]
-
     eval_df = pd.DataFrame(
         {
             "model": [r.name for r in scored],
-            "accuracy": [r.accuracy for r in scored],
-            "f1": [r.f1 for r in scored],
-            "roc_auc": [r.roc_auc for r in scored],
+            "accuracy": [round(r.accuracy, 4) for r in scored],
+            "f1": [round(r.f1, 4) for r in scored],
+            "roc_auc": [None if np.isnan(r.roc_auc) else round(r.roc_auc, 4) for r in scored],
         }
     )
-    eval_df["accuracy"] = eval_df["accuracy"].round(4)
-    eval_df["f1"] = eval_df["f1"].round(4)
-    eval_df["roc_auc"] = eval_df["roc_auc"].round(4)
-    return best, eval_df
+    return scored[0], eval_df
 
 
 def make_candlestick(df: pd.DataFrame, ma_window: int = 20) -> go.Figure:
+    price = get_price_frame(df)
+
     fig = go.Figure()
     fig.add_trace(
         go.Candlestick(
-            x=df.index,
-            open=df["Open"],
-            high=df["High"],
-            low=df["Low"],
-            close=df["Close"],
+            x=price.index,
+            open=price["Open"],
+            high=price["High"],
+            low=price["Low"],
+            close=price["Close"],
             name="Price",
         )
     )
     fig.add_trace(
         go.Scatter(
-            x=df.index,
-            y=df["Close"].rolling(ma_window).mean(),
+            x=price.index,
+            y=price["Close"].rolling(ma_window).mean(),
             mode="lines",
             name=f"MA {ma_window}",
         )
@@ -298,7 +310,6 @@ with st.sidebar:
 
 
 symbol = normalize_ticker(ticker_input, market)
-
 if refresh:
     st.cache_data.clear()
 
@@ -308,23 +319,29 @@ raw = load_data(symbol, period, interval)
 if raw.empty:
     st.error(
         "No data returned. Check the ticker, market suffix, period, or interval. "
-        "For intraday data, Yahoo Finance may limit how much history is available."
+        "Yahoo Finance may limit intraday history."
     )
     st.stop()
 
 if len(raw) < 120:
     st.warning("Very small dataset returned. Predictions may be unstable.")
 
-# Use last rows only for display if the dataset is huge
-plot_df = raw.tail(300).copy()
-fig = make_candlestick(plot_df)
+try:
+    fig = make_candlestick(raw.tail(300).copy())
+except Exception as exc:
+    st.error(f"Could not build price chart: {exc}")
+    st.write("Columns received from Yahoo:")
+    st.write(list(raw.columns))
+    st.stop()
+
 st.plotly_chart(fig, use_container_width=True)
 
-# Feature engineering and model training
 try:
     feat_df, y = add_features(raw)
 except Exception as exc:
     st.error(f"Feature engineering failed: {exc}")
+    st.write("Columns received from Yahoo:")
+    st.write(list(raw.columns))
     st.stop()
 
 if len(feat_df) < 120:
@@ -333,9 +350,12 @@ if len(feat_df) < 120:
 
 best_model, leaderboard = train_best_model(feat_df, y)
 
-# Current prediction from the latest row
 latest_X = feat_df.iloc[[-1]]
-prob_up = float(best_model.model.predict_proba(latest_X)[0, 1]) if hasattr(best_model.model, "predict_proba") else 0.0
+if hasattr(best_model.model, "predict_proba"):
+    prob_up = float(best_model.model.predict_proba(latest_X)[0, 1])
+else:
+    prob_up = 0.5
+
 if prob_up >= threshold:
     signal = "BUY"
 elif prob_up <= 1 - threshold:
@@ -352,9 +372,9 @@ c4.metric("Best model", best_model.name)
 st.markdown("### Model leaderboard")
 st.dataframe(leaderboard, use_container_width=True, hide_index=True)
 
-# Backtest on the hold-out split
 split = max(int(len(feat_df) * 0.8), 50)
 split = min(split, len(feat_df) - 1)
+
 X_train, X_test = feat_df.iloc[:split], feat_df.iloc[split:]
 y_train, y_test = y.iloc[:split], y.iloc[split:]
 
@@ -401,5 +421,6 @@ with st.expander("Model report"):
     st.text(classification_report(y_test, pred_test, zero_division=0))
 
 st.info(
-    "This dashboard is for research and education. Intraday market forecasting is noisy, and any signal should be validated with out-of-sample testing, transaction costs, and risk controls before real use."
+    "This dashboard is for research and education. Intraday market forecasting is noisy, and any signal should be validated "
+    "with out-of-sample testing, transaction costs, and risk controls before real use."
 )
