@@ -1,13 +1,13 @@
 """Intraday Stock Prediction Dashboard
 
-Run locally:
+Run:
     pip install streamlit yfinance pandas numpy scikit-learn plotly
-    streamlit run app.py
+    streamlit run intraday_stock_dashboard.py
 
 Notes:
 - Educational use only. Not financial advice.
-- Yahoo Finance intraday data is limited and may be delayed.
-- This app benchmarks lightweight models and picks the best one on a time-based split.
+- Yahoo Finance intraday data is limited and can be delayed.
+- The app benchmarks a few lightweight models and picks the best one on a time-based validation split.
 """
 
 from __future__ import annotations
@@ -42,20 +42,57 @@ st.set_page_config(
 )
 
 st.title("📈 Intraday Stock Prediction Dashboard")
-st.caption("A Streamlit dashboard for intraday market visualization and next-bar direction prediction.")
+st.caption(
+    "A Streamlit dashboard for intraday market visualization and next-bar direction prediction."
+)
 
 
 # -----------------------------
 # Utilities
 # -----------------------------
+
 def normalize_ticker(symbol: str, market: str) -> str:
     symbol = symbol.strip().upper()
-    if not symbol:
-        return "RELIANCE.NS"
     if "." in symbol:
         return symbol
     suffix = ".NS" if market == "NSE" else ".BO"
     return f"{symbol}{suffix}"
+
+
+def standardize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize Yahoo Finance columns to Open/High/Low/Close/Volume."""
+    out = df.copy()
+
+    def find_col(target: str):
+        target_l = target.lower()
+        for col in out.columns:
+            col_s = str(col).replace(" ", "_").lower()
+            if col_s == target_l:
+                return col
+        for col in out.columns:
+            col_s = str(col).replace(" ", "_").lower()
+            if col_s.endswith(f"_{target_l}") or col_s.startswith(f"{target_l}_") or target_l in col_s:
+                return col
+        return None
+
+    rename_map = {}
+    for canonical in ["Open", "High", "Low", "Close", "Volume"]:
+        source = find_col(canonical)
+        if source is not None and str(source) != canonical:
+            rename_map[source] = canonical
+
+    if rename_map:
+        out = out.rename(columns=rename_map)
+
+    cleaned = []
+    for c in out.columns:
+        if isinstance(c, tuple):
+            parts = [str(p) for p in c if p not in ("", None)]
+            cleaned.append("_".join(parts) if parts else str(c))
+        else:
+            cleaned.append(str(c).replace(" ", "_"))
+    out.columns = cleaned
+    return out
 
 
 @st.cache_data(ttl=300)
@@ -73,21 +110,7 @@ def load_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    df = df.copy()
-
-    # yfinance sometimes returns MultiIndex columns or non-string column labels
-    if isinstance(df.columns, pd.MultiIndex):
-        flat_cols = []
-        for col in df.columns.to_flat_index():
-            parts = [str(part) for part in col if part not in ("", None)]
-            if len(parts) == 1:
-                flat_cols.append(parts[0].replace(" ", "_"))
-            else:
-                flat_cols.append("_".join(parts).replace(" ", "_"))
-        df.columns = flat_cols
-    else:
-        df.columns = [str(c).replace(" ", "_") for c in df.columns]
-
+    df = standardize_ohlcv_columns(df)
     df = df.dropna(how="all")
     return df
 
@@ -103,9 +126,8 @@ def rsi(series: pd.Series, window: int = 14) -> pd.Series:
 def add_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     data = df.copy()
 
-    required = {"Open", "High", "Low", "Close"}
-    if not required.issubset(data.columns):
-        raise ValueError(f"Missing required columns: {sorted(required - set(data.columns))}")
+    if "Close" not in data.columns:
+        raise ValueError("The downloaded data does not contain a Close column.")
 
     close = data["Close"]
     volume = data["Volume"] if "Volume" in data.columns else pd.Series(index=data.index, dtype=float)
@@ -146,11 +168,6 @@ def add_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
         data["vol_sma_20"] = volume.rolling(20).mean()
         data["vol_z"] = (volume - data["vol_sma_20"]) / volume.rolling(20).std()
         data["price_vol"] = data["ret_1"] * data["vol_chg"].fillna(0)
-    else:
-        data["vol_chg"] = np.nan
-        data["vol_sma_20"] = np.nan
-        data["vol_z"] = np.nan
-        data["price_vol"] = np.nan
 
     # Calendar / session features
     idx = pd.DatetimeIndex(data.index)
@@ -162,9 +179,10 @@ def add_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     data["sin_minute"] = np.sin(2 * np.pi * data["minute"] / 60)
     data["cos_minute"] = np.cos(2 * np.pi * data["minute"] / 60)
 
-    # Prediction target: next close higher than current close
+    # Prediction target: whether next close is higher than current close
     data["target"] = (close.shift(-1) > close).astype(int)
 
+    # Drop rows with incomplete features or unknown target
     data = data.replace([np.inf, -np.inf], np.nan).dropna()
 
     y = data.pop("target")
@@ -204,47 +222,37 @@ def train_best_model(X: pd.DataFrame, y: pd.Series) -> Tuple[ModelResult, pd.Dat
     }
 
     scored: list[ModelResult] = []
-
     for name, model in candidates.items():
         model.fit(X_train, y_train)
         pred = model.predict(X_test)
-
+        proba = None
         if hasattr(model, "predict_proba"):
             proba = model.predict_proba(X_test)[:, 1]
-        else:
-            proba = np.full(len(X_test), 0.5)
 
         acc = accuracy_score(y_test, pred)
         f1 = f1_score(y_test, pred, zero_division=0)
-        roc = roc_auc_score(y_test, proba) if len(np.unique(y_test)) > 1 else np.nan
-
-        scored.append(
-            ModelResult(
-                name=name,
-                model=model,
-                accuracy=acc,
-                f1=f1,
-                roc_auc=roc,
-            )
-        )
+        roc = roc_auc_score(y_test, proba) if proba is not None and len(np.unique(y_test)) > 1 else np.nan
+        scored.append(ModelResult(name=name, model=model, accuracy=acc, f1=f1, roc_auc=roc))
 
     scored = sorted(scored, key=lambda r: (r.accuracy, r.f1), reverse=True)
+    best = scored[0]
 
     eval_df = pd.DataFrame(
         {
             "model": [r.name for r in scored],
-            "accuracy": [round(r.accuracy, 4) for r in scored],
-            "f1": [round(r.f1, 4) for r in scored],
-            "roc_auc": [None if np.isnan(r.roc_auc) else round(r.roc_auc, 4) for r in scored],
+            "accuracy": [r.accuracy for r in scored],
+            "f1": [r.f1 for r in scored],
+            "roc_auc": [r.roc_auc for r in scored],
         }
     )
-
-    return scored[0], eval_df
+    eval_df["accuracy"] = eval_df["accuracy"].round(4)
+    eval_df["f1"] = eval_df["f1"].round(4)
+    eval_df["roc_auc"] = eval_df["roc_auc"].round(4)
+    return best, eval_df
 
 
 def make_candlestick(df: pd.DataFrame, ma_window: int = 20) -> go.Figure:
     fig = go.Figure()
-
     fig.add_trace(
         go.Candlestick(
             x=df.index,
@@ -255,7 +263,6 @@ def make_candlestick(df: pd.DataFrame, ma_window: int = 20) -> go.Figure:
             name="Price",
         )
     )
-
     fig.add_trace(
         go.Scatter(
             x=df.index,
@@ -264,7 +271,6 @@ def make_candlestick(df: pd.DataFrame, ma_window: int = 20) -> go.Figure:
             name=f"MA {ma_window}",
         )
     )
-
     fig.update_layout(
         height=600,
         margin=dict(l=20, r=20, t=40, b=20),
@@ -299,21 +305,22 @@ if refresh:
 st.subheader(f"Live view for {symbol}")
 
 raw = load_data(symbol, period, interval)
-
 if raw.empty:
     st.error(
         "No data returned. Check the ticker, market suffix, period, or interval. "
-        "Yahoo Finance may limit intraday history."
+        "For intraday data, Yahoo Finance may limit how much history is available."
     )
     st.stop()
 
 if len(raw) < 120:
     st.warning("Very small dataset returned. Predictions may be unstable.")
 
+# Use last rows only for display if the dataset is huge
 plot_df = raw.tail(300).copy()
 fig = make_candlestick(plot_df)
 st.plotly_chart(fig, use_container_width=True)
 
+# Feature engineering and model training
 try:
     feat_df, y = add_features(raw)
 except Exception as exc:
@@ -326,13 +333,9 @@ if len(feat_df) < 120:
 
 best_model, leaderboard = train_best_model(feat_df, y)
 
+# Current prediction from the latest row
 latest_X = feat_df.iloc[[-1]]
-
-if hasattr(best_model.model, "predict_proba"):
-    prob_up = float(best_model.model.predict_proba(latest_X)[0, 1])
-else:
-    prob_up = 0.5
-
+prob_up = float(best_model.model.predict_proba(latest_X)[0, 1]) if hasattr(best_model.model, "predict_proba") else 0.0
 if prob_up >= threshold:
     signal = "BUY"
 elif prob_up <= 1 - threshold:
@@ -349,9 +352,9 @@ c4.metric("Best model", best_model.name)
 st.markdown("### Model leaderboard")
 st.dataframe(leaderboard, use_container_width=True, hide_index=True)
 
+# Backtest on the hold-out split
 split = max(int(len(feat_df) * 0.8), 50)
 split = min(split, len(feat_df) - 1)
-
 X_train, X_test = feat_df.iloc[:split], feat_df.iloc[split:]
 y_train, y_test = y.iloc[:split], y.iloc[split:]
 
@@ -363,11 +366,7 @@ results = pd.DataFrame(index=X_test.index)
 results["close"] = feat_df.loc[X_test.index, "Close"]
 results["future_return"] = feat_df["Close"].shift(-1).loc[X_test.index] / feat_df.loc[X_test.index, "Close"] - 1
 results["prob_up"] = proba_test
-results["position"] = np.where(
-    results["prob_up"] >= threshold,
-    1,
-    np.where(results["prob_up"] <= 1 - threshold, -1, 0),
-)
+results["position"] = np.where(results["prob_up"] >= threshold, 1, np.where(results["prob_up"] <= 1 - threshold, -1, 0))
 results["strategy_return"] = results["position"] * results["future_return"]
 results["buy_hold"] = results["future_return"]
 results = results.dropna()
@@ -402,6 +401,5 @@ with st.expander("Model report"):
     st.text(classification_report(y_test, pred_test, zero_division=0))
 
 st.info(
-    "This dashboard is for research and education. Intraday market forecasting is noisy, and any signal should be validated "
-    "with out-of-sample testing, transaction costs, and risk controls before real use."
+    "This dashboard is for research and education. Intraday market forecasting is noisy, and any signal should be validated with out-of-sample testing, transaction costs, and risk controls before real use."
 )
