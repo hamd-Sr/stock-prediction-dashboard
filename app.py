@@ -383,10 +383,14 @@ pred_test = model.predict(X_test)
 proba_test = model.predict_proba(X_test)[:, 1] if hasattr(model, "predict_proba") else np.full(len(X_test), 0.5)
 
 results = pd.DataFrame(index=X_test.index)
-results["close"] = feat_df.loc[X_test.index, "Close"]
+results["Close"] = feat_df.loc[X_test.index, "Close"]
 results["future_return"] = feat_df["Close"].shift(-1).loc[X_test.index] / feat_df.loc[X_test.index, "Close"] - 1
 results["prob_up"] = proba_test
-results["position"] = np.where(results["prob_up"] >= threshold, 1, np.where(results["prob_up"] <= 1 - threshold, -1, 0))
+results["position"] = np.where(
+    results["prob_up"] >= threshold,
+    1,
+    np.where(results["prob_up"] <= 1 - threshold, -1, 0)
+)
 results["strategy_return"] = results["position"] * results["future_return"]
 results["buy_hold"] = results["future_return"]
 results = results.dropna()
